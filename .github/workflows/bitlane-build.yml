@@ -87,7 +87,7 @@ jobs:
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    permissions: {statuses: write}
+    permissions: {statuses: write, pull-requests: write}
     steps:
       - name: final statuses
         env:
@@ -110,3 +110,35 @@ jobs:
           [ "$E2E" = true ] || exit 0
           if [ -n "$STATE" ]; then post bitlane/e2e "$STATE" "$DESC"
           else post bitlane/e2e error "NOT RUN: e2e $RUN (gate $GATE, build $BUILD)"; fi
+      - name: deployment report on the PR
+        # one comment per PR, edited in place on every run of its commit. As mumbo-bot when the fork has the app's key
+        # (secret MUMBO_BOT_KEY: app 5295930, installed on every callgideon repo), else as github-actions[bot]
+        env:
+          GH_TOKEN: "${{ github.token }}"
+          APP_KEY: "${{ secrets.MUMBO_BOT_KEY }}"
+          GATE: "${{ needs.gate.result }}"
+          BUILD: "${{ needs.build.result }}"
+          IMG: "${{ needs.build.outputs.image }}"
+          RUN: "${{ needs.e2e.result }}"
+          STATE: "${{ needs.e2e.outputs.state }}"
+          DESC: "${{ needs.e2e.outputs.desc }}"
+        run: |
+          PR=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/pulls" --jq '.[0].number // empty' 2>/dev/null || true)
+          [ -n "$PR" ] || { echo "no PR for $SHA: nothing to report"; exit 0; }
+          if [ -n "$APP_KEY" ]; then  # an installation token for mumbo-bot: RS256 JWT from the key, no new action
+            b64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+            K=$(mktemp); trap 'rm -f "$K"' EXIT; printf '%s\n' "$APP_KEY" > "$K"; now=$(date +%s)
+            h=$(printf '{"alg":"RS256","typ":"JWT"}' | b64); p=$(printf '{"iat":%d,"exp":%d,"iss":"5295930"}' $((now-60)) $((now+540)) | b64)
+            j="$h.$p.$(printf '%s.%s' "$h" "$p" | openssl dgst -sha256 -sign "$K" -binary | b64)"
+            GH_TOKEN=$(curl -sf -X POST -H "Authorization: Bearer $j" -H "Accept: application/vnd.github+json" \
+              https://api.github.com/app/installations/170921050/access_tokens | jq -r .token) || GH_TOKEN="${{ github.token }}"
+            export GH_TOKEN
+          fi
+          URL=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          e2e=${STATE:-not run}; [ "$E2E" = true ] || e2e="not part of this workflow"
+          BODY=$(printf '<!-- bitlane-deploy -->\n### Bitlane deployment: `%s` on `%s`\n\n| Stage | Result |\n|---|---|\n| Hygiene gate | %s |\n| Image build | %s |\n| Image | `%s` |\n| End to end on dev | %s %s |\n\n[Run %s](%s), %s UTC' \
+            "${SHA:0:12}" "$GITHUB_REF_NAME" "$GATE" "$BUILD" "${IMG:-none}" "$e2e" "${DESC:-}" "$GITHUB_RUN_ID" "$URL" "$(date -u '+%F %H:%M')")
+          ID=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate --jq '.[] | select(.body | startswith("<!-- bitlane-deploy -->")) | .id' | tail -1)
+          if [ -n "$ID" ]; then gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$ID" -f body="$BODY" >/dev/null
+          else gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -f body="$BODY" >/dev/null; fi
+          echo "reported on PR #$PR"
