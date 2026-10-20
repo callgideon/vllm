@@ -47,6 +47,9 @@ def in_base(sha, base):
     return {0: True, 1: False}.get(r.returncode)  # 128: commit not here: unknown
 
 
+GH_MERGE = re.compile(r"^Merge pull request #\d+ from callgideon/")
+
+
 def check(base, head, prs):
     errors, notes, rows = [], [], []
     for line in git("rev-list", "--reverse", "--parents", f"{base}..{head}").splitlines():
@@ -54,6 +57,11 @@ def check(base, head, prs):
         s, subject = sha[:12], git("log", "-1", "--format=%s", sha).strip()
         t = trailers(sha)
         if len(parents) > 1:
+            # GitHub's "Merge pull request" button: allowed, its commits are checked one by one in this same loop;
+            # bitlane-sync's daily rebase drops it. Any other merge breaks the linear stack.
+            if GH_MERGE.match(subject):
+                notes.append(f"{s}: {subject} (a PR merge: its commits are checked on their own)")
+                continue
             errors.append(f"{s}: merge commit (the stack is linear: rebase, never merge)")
         if not subject.startswith("[bitlane] "):
             errors.append(f"{s}: subject must start with '[bitlane] ': {subject!r}")
