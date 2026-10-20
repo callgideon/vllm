@@ -1,0 +1,4 @@
+# pytest node ids the CPU test run deselects (bitlane control/build-engine.sh TEST=1): upstream tests in files our
+# stack touches that need a GPU. One per line, each with its reason above it.
+# upstream test, needs a CUDA stream ("current platform may not support current_stream")
+tests/v1/cudagraph/test_cudagraph_manager.py::test_full_capture_sets_graph_pool_id_before_cuda_graph

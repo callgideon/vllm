@@ -1,0 +1,82 @@
+# bitlane: a push to bitlane/release-prod makes a release. The commit must be on bitlane/release-dev, reached by
+# fast-forward, with commit statuses bitlane/image (its CI image digest) and bitlane/qualified (set by bitlane
+# control/fork-qualified.sh after qualification on hardware). Then: that exact image (same digest) is copied to
+# bitlane/vllm-openai:release-<SERIES>.<N> on the builder host, and the tag bitlane/release-<SERIES>.<N> with a GitHub
+# release (base, patches with upstream state, digest, range-diff vs the previous release) is created.
+# The ruleset on bitlane/release-prod (required status bitlane/qualified, no force push) stops a bad push before it
+# lands; this workflow checks the same again and fails loudly if the ruleset is missing.
+name: bitlane release
+on:
+  push:
+    branches: [bitlane/release-prod]
+permissions:
+  contents: write
+  statuses: read
+  id-token: write
+defaults:
+  run: {shell: bash}
+env:
+  SERIES: "0.32.0"  # the upstream vLLM release our base targets; bump by hand when the base passes the next release
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    concurrency: {group: bitlane-builder, cancel-in-progress: false}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with: {fetch-depth: 0, filter: "blob:none", fetch-tags: true, persist-credentials: false}
+      - name: guard (dev commit, fast-forward, image, qualified)
+        env: {GH_TOKEN: "${{ github.token }}", FORCED: "${{ github.event.forced }}", BEFORE: "${{ github.event.before }}"}
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          [ "$FORCED" != true ] || fail "release-prod moves by fast-forward only (forced push)"
+          git fetch -q origin bitlane/release-dev
+          git merge-base --is-ancestor HEAD FETCH_HEAD || fail "$GITHUB_SHA is not on bitlane/release-dev"
+          case $BEFORE in 0000000000000000000000000000000000000000) ;; *) git merge-base --is-ancestor "$BEFORE" HEAD || fail "not a fast-forward from $BEFORE" ;; esac
+          gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/status" --jq '.statuses[] | [.context, .state, .description, .target_url] | @tsv' > st.tsv
+          Q=$(awk -F'\t' '$1 == "bitlane/qualified" && $2 == "success"' st.tsv)
+          [ -n "$Q" ] || fail "no success status bitlane/qualified on $GITHUB_SHA: qualify it first (bitlane control/fork-qualified.sh)"
+          D=$(awk -F'\t' '$1 == "bitlane/image" && $2 == "success" {print $3}' st.tsv)
+          [[ $D =~ ^sha256:[0-9a-f]{64}$ ]] || fail "no bitlane/image digest on $GITHUB_SHA"
+          { echo "DIGEST=$D"; echo "QUALIFIED=$(cut -f3 <<<"$Q") $(cut -f4 <<<"$Q")"; } >> "$GITHUB_ENV"
+      - name: version
+        run: |
+          OLD=$(git tag --points-at HEAD -l 'bitlane/release-*' | head -1)
+          [ -z "$OLD" ] || { echo "::notice::$GITHUB_SHA is already $OLD"; echo "DONE=1" >> "$GITHUB_ENV"; exit 0; }
+          N=$(git tag -l "bitlane/release-$SERIES.*" "bitlane-v$SERIES.*" | sed -E 's/.*\.([0-9]+)$/\1/' | sort -n | tail -1)
+          PREV=$(git tag -l "bitlane/release-$SERIES.$N" "bitlane-v$SERIES.$N" | head -1)
+          echo "VERSION=$SERIES.$((${N:-0} + 1))" >> "$GITHUB_ENV"; echo "PREV=$PREV" >> "$GITHUB_ENV"
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6.3.0
+        if: env.DONE != '1'
+        with: {role-to-assume: "${{ vars.BITLANE_CI_ROLE }}", aws-region: us-east-1}
+      - name: image (same digest) to bitlane/vllm-openai:release-${{ env.VERSION }}
+        if: env.DONE != '1'
+        run: |
+          .bitlane/builder.sh "/opt/bitlane/current/node/fork-ci.sh release $DIGEST release-$VERSION" | tee out.txt
+          IMAGE=$(grep -oE "[^ ]*/bitlane/vllm-openai@$DIGEST" out.txt | tail -1)
+          [ -n "$IMAGE" ] || { echo "::error::the release image is not $DIGEST"; exit 1; }
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+      - name: tag and GitHub release
+        if: env.DONE != '1'
+        env: {GH_TOKEN: "${{ github.token }}", GITHUB_TOKEN: "${{ github.token }}"}
+        run: |
+          git fetch -q --filter=blob:none https://github.com/vllm-project/vllm.git main
+          BASE=$(git merge-base HEAD FETCH_HEAD)
+          {
+            echo "bitlane release $VERSION = upstream vLLM main \`$BASE\` + the patch stack below."
+            echo
+            echo "| | |"; echo "|---|---|"
+            echo "| Commit | \`$GITHUB_SHA\` |"
+            echo "| Base image | \`vllm/vllm-openai:nightly-$BASE\` |"
+            echo "| Image | \`$IMAGE\` |"
+            echo "| Qualified | $QUALIFIED |"
+            echo
+            python3 .bitlane/check-stack.py "$BASE" HEAD --prs
+            if [ -n "$PREV" ]; then
+              echo; echo "### range-diff vs $PREV"; echo '```'
+              git range-diff "$(git merge-base "$PREV" FETCH_HEAD)..$PREV" "$BASE..HEAD"
+              echo '```'
+            fi
+          } > notes.md
+          gh release create "bitlane/release-$VERSION" --target "$GITHUB_SHA" --title "bitlane/release-$VERSION" --notes-file notes.md
+          cat notes.md >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,57 @@
+# bitlane: hygiene gate, then the engine image on the builder host (AWS, via OIDC + SSM). Runs on every push to
+# bitlane/release-dev and when bitlane-sync calls it for a rebased candidate. Result: commit status bitlane/image on
+# the commit, description = the image digest in <account>.dkr.ecr.us-east-1.amazonaws.com/bitlane/vllm-openai-dev.
+# No pull_request trigger: fork PRs never reach AWS. Design: bitlane docs/research/vllm-fork-ci.md.
+name: bitlane build
+on:
+  push:
+    branches: [bitlane/release-dev]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      sha: {type: string, required: true}
+permissions:
+  contents: read
+  statuses: write
+  id-token: write
+defaults:
+  run: {shell: bash}
+env:
+  SHA: ${{ inputs.sha || github.sha }}
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with: {ref: "${{ env.SHA }}", fetch-depth: 0, filter: "blob:none", persist-credentials: false}
+      - name: hygiene gate
+        env: {GITHUB_TOKEN: "${{ github.token }}"}
+        run: |
+          python3 .bitlane/test_check_stack.py
+          git fetch -q --filter=blob:none https://github.com/vllm-project/vllm.git main
+          python3 .bitlane/check-stack.py "$(git merge-base HEAD FETCH_HEAD)" HEAD --prs | tee -a "$GITHUB_STEP_SUMMARY"
+  build:
+    needs: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    concurrency: {group: bitlane-builder, cancel-in-progress: false}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with: {ref: "${{ env.SHA }}", persist-credentials: false}
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6.3.0
+        with: {role-to-assume: "${{ vars.BITLANE_CI_ROLE }}", aws-region: us-east-1}
+      - name: build, CPU unit tests, push (builder host)
+        run: |
+          .bitlane/builder.sh "/opt/bitlane/current/node/fork-ci.sh build $SHA" | tee out.txt
+          IMAGE=$(grep -oE '[^ ]*/bitlane/vllm-openai-dev@sha256:[0-9a-f]{64}' out.txt | tail -1)
+          [ -n "$IMAGE" ] || { echo "::error::no image digest in the builder output"; exit 1; }
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "Image: \`$IMAGE\`" >> "$GITHUB_STEP_SUMMARY"
+      - name: status bitlane/image
+        if: always()
+        env: {GH_TOKEN: "${{ github.token }}"}
+        run: |
+          URL=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          if [ -n "${IMAGE:-}" ]; then S=success D=${IMAGE#*@}; else S=failure D="build failed"; fi
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=$S -f context=bitlane/image -f description="$D" -f target_url="$URL" >/dev/null
