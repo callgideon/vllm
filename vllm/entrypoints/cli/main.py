@@ -6,6 +6,7 @@ Note that all future modules must be lazily loaded within main
 to avoid certain eager import breakage."""
 
 import importlib.metadata
+import os
 import sys
 from importlib.util import find_spec
 
@@ -36,7 +37,15 @@ def maybe_run_omni() -> bool:
     return True
 
 
+BITLANE_VERSION = "0.32.0.3"  # bitlane: the release this stack becomes (bitlane/release-<version>)
+
+
 def main():
+    # bitlane: the first line of every engine log names its build (BITLANE_COMMIT and BITLANE_CHANNEL are set by
+    # bitlane's control/build-engine.sh), so a node's journal shows the fork commit it runs
+    if os.environ.get("BITLANE_COMMIT"):
+        print(f"bitlane {os.environ.get('BITLANE_CHANNEL', 'dev')} release version {BITLANE_VERSION} "
+              f"{os.environ['BITLANE_COMMIT'][:12]}", flush=True)
     if maybe_run_omni():
         return
 
