@@ -60,6 +60,16 @@ with tempfile.TemporaryDirectory() as d:
     assert not ok and "merge commit" in report, report
     sh("git", "reset", "-q", "--hard", top)
 
+    # GitHub's PR merge commit: allowed, but the PR's own commits still pass or fail on their own (PR #3, 2026-10-20)
+    for side_msg, ok_want in [("[bitlane] side\n\nBitlane-only: x", True), ("side without trailer", False)]:
+        sh("git", "checkout", "-q", "-B", "side", base)
+        commit("vllm/s.py", side_msg)
+        sh("git", "checkout", "-q", "main")
+        sh("git", "merge", "-q", "--no-ff", "-m", "Merge pull request #3 from callgideon/side", "side")
+        ok, report = errors(base)
+        assert ok == ok_want, (side_msg, report)
+        sh("git", "reset", "-q", "--hard", top)
+
     # merged upstream and already in the base: the patch should have dropped
     cs.pr_state = lambda n: ("merged", base)
     report, ok = cs.check(base, top, prs=True)
