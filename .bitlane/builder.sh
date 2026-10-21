@@ -2,6 +2,7 @@
 # usage: .bitlane/builder.sh 'shell'   In a workflow, after the OIDC role: runs the shell as root on the bitlane
 # builder host over SSM (instance id in SSM parameter /bitlane/builder_id), waits, prints its output. Exit 1 unless
 # the command succeeded. A person starts the builder (bitlane node/launch.sh), never CI.
+# The e2e it starts reaches off-AWS dev nodes (bitlane control/hosts.yaml) over ssh from the builder.
 set -euo pipefail
 ID=$(aws ssm get-parameter --name /bitlane/builder_id --query Parameter.Value --output text)
 CID=$(aws ssm send-command --instance-ids "$ID" --document-name AWS-RunShellScript --timeout-seconds 600 \
